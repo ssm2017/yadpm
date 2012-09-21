@@ -1,0 +1,6 @@
+name = yadpm
+description="Yet Another Drupal Paypal Module"
+core = 7.x
+dependencies[] = entityreference
+dependencies[] = date
+dependencies[] = list

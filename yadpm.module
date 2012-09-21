@@ -1,0 +1,552 @@
+<?php
+
+/**
+ * Implementation of hook_menu().
+ */
+function yadpm_menu() {
+  $items['admin/config/yadpm'] = array(
+    'title' => 'yadpm',
+    'description' => "Yet another drupal paypal module.",
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('yadpm_admin_form'),
+    'access arguments' => array('admin yadpm'),
+    'type' => MENU_LOCAL_TASK,
+    'file' => 'yadpm.admin.inc'
+  );
+  $items['yadpm/ipnnotification'] = array(
+    'page callback' => 'yadpm_ipnnotification',
+    'access callback' => TRUE,
+    'type' => MENU_CALLBACK,
+  );
+  $items['yadpm/payment/%'] = array(
+    'page callback' => 'yadpm_payment_callback',
+    'page arguments' => array(2),
+    'access callback' => TRUE,
+    'type' => MENU_CALLBACK,
+  );
+  $items['user/%user/transactions'] = array(
+    'title' => 'Transactions',
+    'description' => 'Your paypal transactions',
+    'page callback' => 'yadpm_user_transactions',
+    'page arguments' => array(1),
+    'access callback' => 'yadpm_transactions_user_access', //access arguments don't support multiple arguments, so create our access handler
+    'access arguments' => array(1),
+    'type' => MENU_LOCAL_TASK,
+  );
+  return $items;
+}
+
+function yadpm_payment_callback($type) {
+  switch ($type) {
+    case 'thanks':
+      return t('Thank you for your submission. We are waiting for the payment recept.');
+      break;
+    case 'cancel':
+      return t('You cancelled the payment.');
+      break;
+  }
+}
+
+function yadpm_ipnnotification() {
+  yadpm_writeRAW(array('action' => 'call'));
+  if (!isset($_POST['payment_status']))
+    return;
+
+//  if ($_POST['payment_status'] == 'Pending' && $_POST['pending_reason'] == 'echeck') {
+//    yadpm_writeRAW(array('action' => 'pending'));
+//    yadpm_save_ipn($_POST, 'Pending');
+//    return;
+//  }
+
+  $ipn = $_POST;
+  // get custom values
+  if (!is_array($ipn['custom'])) {
+    $ipn['custom'] = unserialize($ipn['custom']);
+  }
+
+  // get the paypal url
+  $url = 'www.paypal.com';
+  if (variable_get('yadpm_use_sandbox', 1)) {
+    $url = 'www.sandbox.paypal.com';
+  }
+
+  // Build the check header
+  $req = 'cmd=_notify-validate';
+
+  foreach ($_POST as $key => $value) {
+    $value = urlencode(stripslashes($value));
+    $req .= "&$key=$value";
+  }
+
+  $header .= "POST /cgi-bin/webscr HTTP/1.0\r\n";
+  $header .= "Host: $url\r\n";
+  $header .= "Content-Type: application/x-www-form-urlencoded\r\n";
+  $header .= "Content-Length: " . strlen($req) . "\r\n\r\n";
+
+  // send a check request
+  $fp = fsockopen('ssl://' . $url, 443, $errno, $errstr, 30);
+
+  if (!$fp) {
+    // ERREUR HTTP
+    yadpm_writeRAW(array('http_error_code' => $errno, 'http_error_message' => $errstr));
+  }
+  else {
+    fputs($fp, $header . $req);
+    while (!feof($fp)) {
+      $res = fgets($fp, 1024);
+      if (strcmp($res, "VERIFIED") == 0) {
+        yadpm_writeRAW(array('status' => 'verified', 'ipn_id' => $ipn['txn_id']));
+        yadpm_save_ipn($ipn, TRUE);
+        module_invoke_all('yadpm_ipn_verified', $ipn);
+      }
+      else if (strcmp($res, "INVALID") == 0) {
+        yadpm_writeRAW(array('action' => 'invalid ipn', 'ipn_id' => $ipn['txn_id']));
+        yadpm_save_ipn($ipn, FALSE);
+        module_invoke_all('yadpm_ipn_invalid', $ipn);
+      }
+    }
+    fclose($fp);
+  }
+  echo "done\n";
+}
+
+function yadpm_save_ipn($ipn, $verified = FALSE) {
+  if (!$verified) return;
+  // get time values
+  $time = time();
+  $payment_date = (!isset($ipn['payment_date']) || empty($ipn['payment_date'])) ? $time : strtotime($ipn['payment_date']);
+
+  // get the transaction node
+  $query = db_select('field_data_yadpm_transaction_id', 'ft');
+  $query
+      ->condition('ft.yadpm_transaction_id_value', $ipn['txn_id'])
+      ->fields('ft', array('entity_id'))
+      ->range(0, 1);
+  $nid = $query->execute()->fetchField();
+
+  if ($nid) {
+    // add a new revision
+    $node = node_load($nid);
+    $node->revision = 1;
+    $node->log = 'Updated by ipn call ' . date('d/m/Y H:i:s', $time);
+  }
+  else {
+    //create a node
+    $node = new stdClass();
+    $node->type = 'yadpm_transaction';
+    node_object_prepare($node);
+
+    $node->title = $ipn['txn_id'];
+    $node->language = LANGUAGE_NONE;
+  }
+  $node->uid = $ipn['custom']['uid'];
+  $node->yadpm_transaction_id[$node->language][0]['value'] = $ipn['txn_id'];
+  $node->yadpm_uid[$node->language][0]['target_id'] = $ipn['custom']['uid'];
+  $node->yadpm_request_date[$node->language][0]['value'] = $ipn['custom']['timestamp'];
+  $node->yadpm_payment_date[$node->language][0]['value'] = $payment_date;
+  $node->yadpm_data[$node->language][0]['value'] = serialize($ipn);
+  $node->yadpm_status[$node->language][0]['value'] = $ipn['payment_status'];
+  $ipn['status'] = $ipn['payment_status'];
+
+  node_save($node);
+
+
+  $log = array(
+    $time, // 0 date
+    $status, // 1 status
+    date('d/m/Y H:i:s', $time), // 2 payment_date
+    $ipn['custom']['uid'], // 3 uid
+    $ipn['payer_email'], // 4 payer_email
+    $ipn['txn_id'], // 5 txn_id
+    $ipn['mc_gross'], // 6 mc_gross
+    $ipn['receiver_email'], // 7 email
+  );
+  yadpm_writeCSV($log);
+  yadpm_writeRAW($ipn);
+}
+
+/**
+ * Implementation of hook_perm().
+ */
+function yadpm_permission() {
+  return array(
+    'admin yadpm' => array(
+      'title' => t('Configure the yadpm parameters.'),
+    )
+  );
+}
+
+function yadpm_writeRAW($ipn = array()) {
+  // check if the log file exists
+  $filename = variable_get('yadpm_logfilepath', '/var/www') . '/yadpm.txt';
+  $exists = is_file($filename);
+
+  // check if the log file is writable
+  if ($exists && !is_writable($filename)) {
+    return;
+  }
+
+  $fh = fopen($filename, 'a+') or die("can't open file");
+  $stringData = "************** START " . date(DATE_RFC822) . "****************\n";
+  $stringData .= print_r($ipn, true) . "\n";
+  $stringData .= "************** END ****************\n";
+  fwrite($fh, $stringData);
+  fclose($fh);
+}
+
+function yadpm_writeCSV($log = array()) {
+  // check if the log file exists
+  $filename = variable_get('yadpm_logfilepath', '/var/www') . '/yadpm.csv';
+  $exists = is_file($filename);
+
+  // check if the log file is writable
+  if ($exists && !is_writable($filename)) {
+    return;
+  }
+
+  $fh = fopen($filename, 'a+') or die("can't open file");
+
+  if (!$exists) {
+    $headings = array(
+      'date', // 0 date
+      'status', // 1 status
+      'payment_date', // 2 payment_date
+      'uid', // 3 uid
+      'payer_email', // 4 payer_email
+      'txn_id', // 5 txn_id
+      'mc_gross', // 6 mc_gross
+      'receiver_email', // 7 email
+    );
+    fputcsv($fh, $headings, ';');
+  }
+  fputcsv($fh, $log, ';');
+  fclose($fh);
+}
+
+function yadpm_payment_form($form, &$form_state, $options = array()) {
+  /*
+    if (isset($options['text'])) {
+    $form['amount_text'] = array(
+    '#type' => 'markup',
+    '#value' => $options['text'],
+    );
+    }
+
+    $form['amount_display'] = array(
+    '#type' => 'markup',
+    '#value' => '<p>' . t('Effectuez votre paiement de !price (euros)', array('!price' => $options['amount'] . '€')) . '</p>',
+    );
+    $form['amount'] = array(
+    '#type' => 'hidden',
+    '#value' => $options['amount'],
+    '#name' => 'amount',
+    );
+
+    $action = 'https://www.paypal.com/cgi-bin/webscr';
+    if (variable_get('yadpm_use_sandbox', 1)) {
+    $action = 'https://www.sandbox.paypal.com/cgi-bin/webscr';
+    }
+    $form['#action'] = $action;
+
+    $form['business'] = array(
+    '#type' => 'hidden',
+    '#name' => 'business',
+    '#value' => variable_get('yadpm_receiver', ''),
+    );
+
+    $form['cmd'] = array(
+    '#type' => 'hidden',
+    '#value' => '_xclick',
+    '#name' => 'cmd',
+    );
+
+    $form['item_name'] = array(
+    '#type' => 'hidden',
+    '#value' => isset($options['item_name']) ? check_plain($options['item_name']) : t('Donation'),
+    '#name' => 'item_name',
+    );
+
+    $form['item_number'] = array(
+    '#type' => 'hidden',
+    '#value' => isset($options['item_number']) ? ((int) $options['item_number']) : 0,
+    '#name' => 'item_number',
+    );
+    $form['no_shipping'] = array(
+    '#type' => 'hidden',
+    '#value' => 1,
+    '#name' => 'no_shipping',
+    );
+    $form['return'] = array(
+    '#type' => 'hidden',
+    '#value' => isset($options['return_url']) ? $options['return_url'] : $GLOBALS['base_url'] . '/fg/paiement/remerciements',
+    '#name' => 'return',
+    );
+    $form['cancel_url'] = array(
+    '#type' => 'hidden',
+    '#value' => isset($options['cancel_url']) ? $options['cancel_url'] : $GLOBALS['base_url'] . '/fg/paiement/annulation',
+    '#name' => 'cancel_return',
+    );
+    $form['currency_code'] = array(
+    '#type' => 'hidden',
+    '#value' => isset($options['currency_code']) ? $options['currency_code'] : 'EUR',
+    '#name' => 'currency_code',
+    );
+    //   $form['charset'] = array(
+    //    '#type' => 'hidden',
+    //    '#value' => 'utf-8',
+    //    '#name' => 'charset',
+    //    );
+
+    $form['notify_url'] = array(
+    '#type' => 'hidden',
+    '#value' => (!isset($options['ipn_notification_url'])) ? $GLOBALS['base_url'] . '/fg/paypal/ipnnotification' : $options['ipn_notification_url'],
+    '#name' => 'notify_url',
+    );
+
+    if (empty($options['custom']) || !is_array($options['custom'])) {
+    $options['custom'] = array();
+    $options['custom']['module'] = 'FG_PAYPAL';
+    $options['custom']['timestamp'] = time();
+    }
+
+    $form['custom'] = array(
+    '#type' => 'hidden',
+    '#value' => serialize($options['custom']),
+    '#name' => 'custom',
+    );
+
+    if (isset($options['hidden']) && is_array($options['hidden']) && !empty($options['hidden'])) {
+    foreach ($options['hidden'] as $key => $value) {
+    // Do not override existing values
+    if (!isset($form[$key])) {
+    $form[$key] = array(
+    '#type' => 'hidden',
+    '#value' => check_plain($value),
+    );
+    }
+    }
+    }
+
+    if (isset($options['button_url']) && $options['button_url']) {
+    $form['submit'] = array(
+    '#type' => 'image_button',
+    '#value' => $options['button_text'],
+    '#attributes' => array('src' => $options['button_url']),
+    '#name' => 'submit',
+    );
+    }
+    else {
+    $form['submit'] = array(
+    '#type' => 'submit',
+    '#value' => isset($options['button_text']) ? $options['button_text'] : 'Payer avec paypal',
+    '#name' => 'submit',
+    );
+    } */
+  return $form;
+}
+
+/**
+ * Source : http://www.wikistuce.info/doku.php/articles/mise_en_place_d_un_paiement_paypal_sur_site_marchand
+ */
+function yadpm_crypted_payment_form($form, &$form_state, $params = array()) {
+  // check params
+  $params['text'] = isset($params['text']) ? check_plain($params['text']) : NULL;
+  $params['amount'] = isset($params['amount']) ? $params['amount'] : NULL;
+  $params['item_name'] = isset($params['item_name']) ? check_plain($params['item_name']) : t('Donation');
+  $params['item_number'] = isset($params['item_number']) ? ((int) $params['item_number']) : 0;
+  $params['return_url'] = isset($params['return_url']) ? $params['return_url'] : $GLOBALS['base_url'] . '/yadpm/payment/thanks';
+  $params['cancel_url'] = isset($params['cancel_url']) ? $params['cancel_url'] : $GLOBALS['base_url'] . '/yadpm/payment/cancel';
+  $params['currency_code'] = isset($params['currency_code']) ? $params['currency_code'] : 'EUR';
+  $params['ipn_notification_url'] = isset($params['ipn_notification_url']) ? $params['ipn_notification_url'] : $GLOBALS['base_url'] . '/yadpm/ipnnotification';
+  $params['button_url'] = isset($params['button_url']) ? $params['button_url'] : NULL;
+  $params['button_text'] = isset($params['button_text']) ? $params['button_text'] : t('Pay');
+  if (empty($params['custom']) || !is_array($params['custom'])) {
+    $params['custom'] = array();
+    $params['custom']['module'] = 'yadpm';
+    $params['custom']['timestamp'] = time();
+  }
+
+  // pre text
+  if ($params['text']) {
+    $form['amount_text'] = array(
+      '#markup' => $params['text'],
+    );
+  }
+
+  // amount display
+  $form['amount_display'] = array(
+    '#markup' => '<p>' . t('Click on the button to pay !price (euros)', array('!price' => $params['amount'] . '€')) . '</p>',
+  );
+  $form['amount'] = array(
+    '#type' => 'hidden',
+    '#value' => $params['amount'],
+    '#name' => 'amount',
+  );
+
+  // action
+  $action = 'https://www.paypal.com/cgi-bin/webscr';
+  if (variable_get('yadpm_use_sandbox', 1)) {
+    $action = 'https://www.sandbox.paypal.com/cgi-bin/webscr';
+  }
+  $form['#action'] = $action;
+
+  // Define the paths for openssl
+  putenv("HOME=~");
+  $my_key_file = variable_get('yadpm_my_key_file_path', '');
+  $my_cert_file = variable_get('yadpm_my_cert_file_path', '');
+  $paypal_cert_file = variable_get('yadpm_paypal_cert_file_path', '');
+  $openssl = variable_get('yadpm_openssl_path', '/usr/bin/openssl');
+
+  $hash = array(
+    'amount' => $params['amount'], // amount to pay
+    'item_name' => $params['item_name'], // name of the order
+    'item_number' => $params['item_number'], // number of the order
+    'return' => $params['return_url'], // return address when the user clicks on "return to the shop"
+    'cancel_return' => $params['cancel_url'], //Adresse de retour pour les annulations
+    'currency_code' => $params['currency_code'], //Devise
+    'notify_url' => $params['ipn_notification_url'], // Url called by paypal at the payment, this page will allow the treatment of the paid orders.
+    'custom' => serialize($params['custom']), // variable allowing you to use different informations on the return page
+    'business' => variable_get('yadpm_receiver', ''), // seller address (the one who receives the payment)
+    'cert_id' => variable_get('yadpm_cert_id', ''), // cert id given by paypal
+    'cmd' => '_xclick', // tell paypal that we are using a "pay now" button
+    'no_shipping' => '1', // the customer is not invited to enter his address
+    'charset' => 'utf-8', // charset
+    'lc' => 'FR', // language of the paypal interface
+    'no_note' => '1', // Forbid the user to add comments with the payment.
+      //'invoice'       => '1',// unique value to prevent accidental payments (must be different for every payment)
+      //'cpp_header_image' => 'http://www.domaine.com/logo.jpg',// Url of the image located at the top of the payment page (750x90px maxi)
+      // ideally, this image must be located on a securized server to prevent receiving a message that some elements of the page are not securized.
+  );
+  $contentBytes = array();
+  foreach ($hash as $name => $value) {
+    if ($value != "") {
+      $contentBytes[] = "$name=$value";
+    }
+  }
+  $contentBytes = implode("\n", $contentBytes);
+
+  module_load_include('php', 'yadpm', 'PPCrypto');
+  $button = PPCrypto::signAndEncrypt($contentBytes, $my_cert_file, $my_key_file, '', $paypal_cert_file);
+  if ($button['status']) {
+    $form['encrypted'] = array(
+      '#type' => 'hidden',
+      '#value' => "-----BEGIN PKCS7-----" . $button["encryptedData"] . "-----END PKCS7-----",
+      '#name' => 'encrypted',
+    );
+    $form['cmd'] = array(
+      '#type' => 'hidden',
+      '#value' => '_s-xclick',
+      '#name' => 'cmd',
+    );
+    if ($params['button_url']) {
+      $form['submit'] = array(
+        '#type' => 'image_button',
+        '#value' => $params['button_text'],
+        '#attributes' => array('src' => $params['button_url']),
+        '#name' => 'submit',
+      );
+    }
+    else {
+      $form['submit'] = array(
+        '#type' => 'submit',
+        '#value' => isset($params['button_text']) ? $params['button_text'] : 'Payer avec paypal',
+        '#name' => 'submit',
+      );
+    }
+    return $form;
+  }
+  else {
+    $form['error'] = array(
+      '#markup' => $button['error_msg'],
+    );
+    return $form;
+  }
+}
+
+/**
+ * source : https://www.x.com/message/173736#173736
+ */
+function yadpm_decodePayPalIPN($raw_post) {
+  if (empty($raw_post)) {
+    return array();
+  } # else:
+  $post = array();
+  $pairs = explode('&', $raw_post);
+  foreach ($pairs as $pair) {
+    list($key, $value) = explode('=', $pair, 2);
+    $key = urldecode($key);
+    $value = urldecode($value);
+    # This is look for a key as simple as 'return_url' or as complex as 'somekey[x].property'
+    preg_match('/(\w+)(?:\[(\d+)\])?(?:\.(\w+))?/', $key, $key_parts);
+    switch (count($key_parts)) {
+      case 4:
+        # Original key format: somekey[x].property
+        # Converting to $post[somekey][x][property]
+        if (!isset($post[$key_parts[1]])) {
+          $post[$key_parts[1]] = array($key_parts[2] => array($key_parts[3] => $value));
+        }
+        else if (!isset($post[$key_parts[1]][$key_parts[2]])) {
+          $post[$key_parts[1]][$key_parts[2]] = array($key_parts[3] => $value);
+        }
+        else {
+          $post[$key_parts[1]][$key_parts[2]][$key_parts[3]] = $value;
+        }
+        break;
+      case 3:
+        # Original key format: somekey[x]
+        # Converting to $post[somkey][x]
+        if (!isset($post[$key_parts[1]])) {
+          $post[$key_parts[1]] = array();
+        }
+        $post[$key_parts[1]][$key_parts[2]] = $value;
+        break;
+      default:
+        # No special format
+        $post[$key] = $value;
+        break;
+    }#switch
+  }#foreach
+
+  return $post;
+}
+
+function yadpm_transactions_user_access($account) {
+  return ($GLOBALS['user']->uid == 1 || $GLOBALS['user']->uid == $account->uid);
+}
+
+function yadpm_user_transactions($account) {
+
+  // get the transactions by user
+  $query = new EntityFieldQuery();
+  $entities = $query->entityCondition('entity_type', 'node')
+      ->entityCondition('bundle', 'yadpm_transaction')
+      ->fieldCondition('yadpm_uid', 'target_id', $account->uid, '=')
+      ->execute();
+
+  $nodes = node_load_multiple(array_keys($entities['node']));
+
+  // build a table to display the results
+  $content = array();
+  if (!empty($nodes)) {
+    foreach ($nodes as $node) {
+      $rows[] = array(
+        'data' => array(
+          'title' => l($node->title, 'node/' . $node->nid),
+          'status' => $node->yadpm_status[$node->language][0]['value'],
+        ),
+      );
+    }
+    $content['entity_table'] = array(
+      '#theme' => 'table',
+      '#rows' => $rows,
+      '#header' => array(t('Title'), t('Status')),
+    );
+  }
+  else {
+    $content[] = array(
+      '#type' => 'item',
+      '#markup' => t('No transactions currently exist.'),
+    );
+  }
+  return $content;
+}

@@ -1,0 +1,179 @@
+<?php
+
+/**
+ * Implements hook_install().
+ */
+function yadpm_install() {
+  $t = get_t();
+
+  // We define the node type as an associative array.
+  $yadpm = array(
+    'type' => 'yadpm_transaction',
+    'name' => $t('Paypal transaction'),
+    'base' => 'node_content',
+    'description' => $t('This is a node to record a paypal transaction by user.'),
+    'title_label' => $t('Title'),
+    'custom' => TRUE,
+  );
+  $content_type = node_type_set_defaults($yadpm);
+
+  // Save the content type
+  node_type_save($content_type);
+
+  // Create all the fields we are adding to our content type.
+  foreach (_yadpm_installed_fields() as $field) {
+    field_create_field($field);
+  }
+
+  // Create all the instances for our fields.
+  foreach (_yadpm_installed_instances() as $instance) {
+    $instance['entity_type'] = 'node';
+    $instance['bundle'] = $yadpm['type'];
+    field_create_instance($instance);
+  }
+}
+
+/**
+ * Implements hook_uninstall().
+ */
+function yadpm_uninstall() {
+
+  $sql = 'SELECT nid FROM {node} n WHERE n.type = :type';
+  $result = db_query($sql, array(':type' => 'yadpm_transaction'));
+  $nids = array();
+  foreach ($result as $row) {
+    $nids[] = $row->nid;
+  }
+
+  // Delete all the nodes at once
+  node_delete_multiple($nids);
+
+  foreach (array_keys(_yadpm_installed_fields()) as $field) {
+    field_delete_field($field);
+  }
+
+  $instances = field_info_instances('node', 'yadpm_transaction');
+  foreach ($instances as $instance_name => $instance) {
+    field_delete_instance($instance);
+  }
+
+  // Delete our content type
+  node_type_delete('yadpm_transaction');
+
+  // Purge all field infromation
+  field_purge_batch(1000);
+}
+
+/**
+ * Returns a structured array defining the fields created by this content type.
+ */
+function _yadpm_installed_fields() {
+  $t = get_t();
+  return array(
+    'transaction_id' => array(
+      'field_name' => 'yadpm_transaction_id',
+      'type'        => 'text',
+      'settings'    => array(
+        'max_length' => 32,
+      ),
+    ),
+    'uid' => array(
+      'field_name' => 'yadpm_uid',
+      'type'        => 'entityreference',
+      'settings'    => array(
+        'target_type' => 'user',
+      ),
+    ),
+    'request_date' => array(
+      'field_name' => 'yadpm_request_date',
+      'type'        => 'datestamp',
+      'settings'    => array(
+        'granularity' => array(
+          'month' => 'month',
+          'day' => 'day',
+          'hour' => 'hour',
+          'minute' => 'minute',
+          'second' => 'second',
+          'year' => 'year',
+        ),
+      ),
+    ),
+    'payment_date' => array(
+      'field_name' => 'yadpm_payment_date',
+      'type'        => 'datestamp',
+      'settings'    => array(
+        'granularity' => array(
+          'month' => 'month',
+          'day' => 'day',
+          'hour' => 'hour',
+          'minute' => 'minute',
+          'second' => 'second',
+          'year' => 'year',
+        ),
+      ),
+    ),
+    'data' => array(
+      'field_name' => 'yadpm_data',
+      'type'        => 'text_long',
+    ),
+    'status' => array(
+      'field_name' => 'yadpm_status',
+      'type'        => 'list_text',
+      'settings'    => array(
+        'allowed_values' => array(
+          'Canceled_Reversal' => 'Canceled_Reversal',
+          'Completed' => 'Completed',
+          'Denied' => 'Denied',
+          'Expired' => 'Expired',
+          'Failed' => 'Failed',
+          'In-Progress' => 'In-Progress',
+          'Partially_Refunded' => 'Partially_Refunded',
+          'Pending' => 'Pending',
+          'Processed' => 'Processed',
+          'Refunded' => 'Refunded',
+          'Reversed' => 'Reversed',
+          'Voided' => 'Voided'
+        ),
+      ),
+    ),
+  );
+}
+
+/**
+ * Returns a structured array defining the instances for this content type.
+ */
+function _yadpm_installed_instances() {
+  $t = get_t();
+  return array(
+    'yadpm_status' => array(
+      'field_name' => 'yadpm_status',
+      'label' => $t('Status'),
+    ),
+    'yadpm_transaction_id' => array(
+      'field_name' => 'yadpm_transaction_id',
+      'label' => $t('Transaction ID'),
+    ),
+    'yadpm_uid' => array(
+      'field_name' => 'yadpm_uid',
+      'label' => $t('uid'),
+    ),
+    'request_date' => array(
+      'field_name' => 'yadpm_request_date',
+      'label' => $t('Request date'),
+    ),
+    'payment_date' => array(
+      'field_name' => 'yadpm_payment_date',
+      'label' => $t('Payment date'),
+    ),
+    'yadpm_data' => array(
+      'field_name' => 'yadpm_data',
+      'label' => $t('Data'),
+      'display' => array(
+        'default' => array(
+          'label' => 'hidden',
+          'type' => 'hidden',
+        ),
+      ),
+    ),
+  );
+}
